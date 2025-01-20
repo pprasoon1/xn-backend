@@ -17,14 +17,14 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: 'https://your-frontend-domain.vercel.app', // Replace with your frontend domain
+        origin: '*', // Replace with your frontend domain
         methods: ['GET', 'POST'],
         credentials: true,
         allowedHeaders: ['Content-Type', 'Authorization'],
     }
 });
 app.use(cors({
-    origin: 'https://your-frontend-domain.vercel.app', // Replace with your frontend domain
+    origin: '*', // Replace with your frontend domain
     methods: ['GET', 'POST'],
     credentials: true,
     allowedHeaders: ['Content-Type', 'Authorization'],
@@ -35,12 +35,18 @@ app.use(express.json());
 const userTerminals = new Map();
 const userContainers = new Map();
 
-// Function to ensure user directory exists
+// Function to ensure user directory exists and has an initial file
 function ensureUserDirectoryExists(userId) {
     const userDir = path.join(__dirname, './user', userId);
     if (!fs.existsSync(userDir)) {
         fs.mkdirSync(userDir, { recursive: true });
         console.log(`Created user directory: ${userDir}`);
+        // Create an initial file
+        const initialFilePath = path.join(userDir, 'index.js');
+        if (!fs.existsSync(initialFilePath)) {
+            fs.writeFileSync(initialFilePath, 'console.log("Hello, World!");');
+            console.log(`Created initial file: ${initialFilePath}`);
+        }
     }
 }
 
