@@ -17,14 +17,14 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: '*', // Replace with your frontend domain
+        origin: 'https://your-frontend-domain.vercel.app', // Replace with your frontend domain
         methods: ['GET', 'POST'],
         credentials: true,
         allowedHeaders: ['Content-Type', 'Authorization'],
     }
 });
 app.use(cors({
-    origin: '*', // Replace with your frontend domain
+    origin: 'https://your-frontend-domain.vercel.app', // Replace with your frontend domain
     methods: ['GET', 'POST'],
     credentials: true,
     allowedHeaders: ['Content-Type', 'Authorization'],
@@ -200,6 +200,9 @@ app.get('/files', async (req, res) => {
         ensureUserDirectoryExists(userId);
         const userDir = path.join(__dirname, './user', userId);
         const fileTree = await generateFileTree(userDir);
+        if (Object.keys(fileTree).length === 0) {
+            console.warn(`Empty file tree for user ${userId}: ${userDir}`);
+        }
         return res.json({ tree: fileTree });
     } catch (error) {
         console.error('Error generating file tree:', error);
