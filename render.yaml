@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: xncode-backend
+    env: node
+    plan: starter
+    region: oregon
+    buildCommand: "npm install && npm rebuild node-pty"
+    startCommand: "node server.js"
+    ports:
+      - port: 9000
+    envVars:
+      - key: NODE_ENV
+        value: production
+    healthCheckPath: /
+    autoDeploy: true
+    githubConnect:
+      repo: https://github.com/pprasoon1/xn-backend
+      branch: main
