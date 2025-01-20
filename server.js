@@ -17,16 +17,32 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: '*',
-        methods: ['GET', 'POST']
+        origin: '*', // Replace with your frontend domain
+        methods: ['GET', 'POST'],
+        credentials: true,
+        allowedHeaders: ['Content-Type', 'Authorization'],
     }
 });
-app.use(cors());
+app.use(cors({
+    origin: '*', // Replace with your frontend domain
+    methods: ['GET', 'POST'],
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 app.use(express.json());
 
 // Store PTY instances and container names for each user
 const userTerminals = new Map();
 const userContainers = new Map();
+
+// Function to ensure user directory exists
+function ensureUserDirectoryExists(userId) {
+    const userDir = path.join(__dirname, './user', userId);
+    if (!fs.existsSync(userDir)) {
+        fs.mkdirSync(userDir, { recursive: true });
+        console.log(`Created user directory: ${userDir}`);
+    }
+}
 
 // Function to start Docker container
 function startContainer(userId, projectPath) {
@@ -65,9 +81,7 @@ function stopContainer(containerName) {
 // Initialize PTY process
 function initializePty(userId) {
     const cwd = path.join(__dirname, './user', userId);
-    if (!fs.existsSync(cwd)) {
-        fs.mkdirSync(cwd, { recursive: true });
-    }
+    ensureUserDirectoryExists(userId);
     const term = pty.spawn(shell, [], {
         name: 'xterm-color',
         cols: 80,
@@ -120,6 +134,9 @@ io.on('connection', (socket) => {
     console.log('New connection:', socket.id);
     const userId = socket.id;
     socket.userId = userId;
+
+    // Ensure user directory exists
+    ensureUserDirectoryExists(userId);
 
     // Initialize terminal for user
     const term = initializePty(userId);
@@ -176,11 +193,13 @@ io.on('connection', (socket) => {
 // API Routes
 app.get('/files', async (req, res) => {
     try {
-        const userId = req.query.userId; // Ensure you pass userId in the query
+        const userId = req.query.userId;
         if (!userId) {
             return res.status(400).json({ error: 'User ID query parameter is required' });
         }
-        const fileTree = await generateFileTree(path.join('./user', userId));
+        ensureUserDirectoryExists(userId);
+        const userDir = path.join(__dirname, './user', userId);
+        const fileTree = await generateFileTree(userDir);
         return res.json({ tree: fileTree });
     } catch (error) {
         console.error('Error generating file tree:', error);
@@ -191,12 +210,17 @@ app.get('/files', async (req, res) => {
 app.get('/files/content', async (req, res) => {
     try {
         const filePath = req.query.path;
-        const userId = req.query.userId; // Ensure you pass userId in the query
+        const userId = req.query.userId;
         if (!filePath || !userId) {
             return res.status(400).json({ error: 'Path and User ID query parameters are required' });
         }
+        ensureUserDirectoryExists(userId);
+        const userDir = path.join(__dirname, './user', userId);
         const normalizedPath = filePath.replace(/^\.\/|^\//, '');
-        const fullPath = path.join('./user', userId, normalizedPath);
+        const fullPath = path.join(userDir, normalizedPath);
+        if (!fs.existsSync(fullPath)) {
+            return res.status(404).json({ error: 'File not found' });
+        }
         const content = await fs.promises.readFile(fullPath, 'utf8');
         return res.json({ content });
     } catch (error) {
@@ -208,20 +232,25 @@ app.get('/files/content', async (req, res) => {
 // Generate file tree recursively
 async function generateFileTree(directory) {
     const tree = {};
-    async function buildTree(currentDir, currentTree) {
-        const files = await fs.promises.readdir(currentDir);
+    try {
+        if (!fs.existsSync(directory)) {
+            console.log(`Directory does not exist: ${directory}`);
+            return tree;
+        }
+        const files = await fs.promises.readdir(directory);
         for (const file of files) {
-            const filePath = path.join(currentDir, file);
+            const filePath = path.join(directory, file);
             const stat = await fs.promises.stat(filePath);
             if (stat.isDirectory()) {
-                currentTree[file] = {};
-                await buildTree(filePath, currentTree[file]);
+                tree[file] = await generateFileTree(filePath);
             } else {
-                currentTree[file] = null;
+                tree[file] = null;
             }
         }
+    } catch (error) {
+        console.error('Error generating file tree:', error);
+        throw error;
     }
-    await buildTree(directory, tree);
     return tree;
 }
 
