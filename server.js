@@ -17,14 +17,14 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: 'https://your-frontend-domain.vercel.app', // Replace with your frontend domain
+        origin: '*', // Replace with your frontend domain
         methods: ['GET', 'POST'],
         credentials: true,
         allowedHeaders: ['Content-Type', 'Authorization'],
     }
 });
 app.use(cors({
-    origin: 'https://your-frontend-domain.vercel.app', // Replace with your frontend domain
+    origin: '*', // Replace with your frontend domain
     methods: ['GET', 'POST'],
     credentials: true,
     allowedHeaders: ['Content-Type', 'Authorization'],
