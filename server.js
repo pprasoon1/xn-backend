@@ -10,21 +10,21 @@ const chokidar = require('chokidar');
 const { exec } = require('child_process');
 
 // Shell configuration
-const shell = os.platform() === 'win32' ? 'powershell.exe' : 'bash';
+const shell = 'bash'; // Use bash directly
 
 // Express and Socket.IO setup
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: '*', // Replace with your frontend domain
+        origin: 'https://your-frontend-domain.vercel.app', // Replace with your frontend domain
         methods: ['GET', 'POST'],
         credentials: true,
         allowedHeaders: ['Content-Type', 'Authorization'],
     }
 });
 app.use(cors({
-    origin: '*', // Replace with your frontend domain
+    origin: 'https://your-frontend-domain.vercel.app', // Replace with your frontend domain
     methods: ['GET', 'POST'],
     credentials: true,
     allowedHeaders: ['Content-Type', 'Authorization'],
@@ -35,7 +35,7 @@ app.use(express.json());
 const userTerminals = new Map();
 const userContainers = new Map();
 
-// Function to ensure user directory exists and has an initial file
+// Function to ensure user directory exists and has initial files
 function ensureUserDirectoryExists(userId) {
     const userDir = path.join(__dirname, './user', userId);
     if (!fs.existsSync(userDir)) {
