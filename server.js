@@ -1,290 +1,229 @@
 const http = require('http');
 const express = require('express');
 const fs = require('fs');
-const path = require('path');
 const { Server } = require('socket.io');
 const pty = require('node-pty');
+const os = require('os');
+const path = require('path');
 const cors = require('cors');
 const chokidar = require('chokidar');
 const { exec } = require('child_process');
 
+// Shell configuration
+const shell = os.platform() === 'win32' ? 'powershell.exe' : 'bash';
+
+// Express and Socket.IO setup
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
+    cors: {
+        origin: '*',
+        methods: ['GET', 'POST']
+    }
 });
-
-// Configuration
-const USER_DIR = path.join(__dirname, 'users');
-const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
-
 app.use(cors());
 app.use(express.json());
 
-// Store active sessions
+// Store PTY instances and container names for each user
 const userTerminals = new Map();
 const userContainers = new Map();
 
-// Helpers
-const ensureUserDir = (userId) => {
-  const userDir = path.join(USER_DIR, userId);
-  if (!fs.existsSync(userDir)) {
-    fs.mkdirSync(userDir, { recursive: true });
-    fs.chmodSync(userDir, 0o755);
-    log('debug', `Created user directory: ${userDir}`);
-  }
-  return userDir;
-};
-
-const log = (level, message) => {
-  if (LOG_LEVEL === 'debug' || level === 'error') {
-    console.log(`[${new Date().toISOString()}] [${level}] ${message}`);
-  }
-};
-
-// Docker management
-const startContainer = async (userId, projectPath) => {
-  const containerName = `user_${userId}`;
-  const resolvedPath = path.resolve(projectPath);
-  const command = `docker run -d --rm --name ${containerName} -v "${resolvedPath}:/app" -w /app node:latest tail -f /dev/null`;
-
-  return new Promise((resolve, reject) => {
-    exec(command, (err, stdout) => {
-      if (err) return reject(err);
-      userContainers.set(userId, containerName);
-      log('info', `Container started: ${containerName}`);
-      resolve(containerName);
+// Function to start Docker container
+function startContainer(userId, projectPath) {
+    const containerName = `user_${userId}`;
+    const resolvedPath = path.resolve(projectPath);
+    const command = `docker run -d --rm --name ${containerName} -v "${resolvedPath}:/app" -w /app node:latest`;
+    return new Promise((resolve, reject) => {
+        exec(command, (err, stdout) => {
+            if (err) {
+                console.error(`Error starting container for user ${userId}:`, err);
+                reject(err);
+            } else {
+                console.log(`Container started for user ${userId}: ${stdout.trim()}`);
+                userContainers.set(userId, containerName);
+                resolve(containerName);
+            }
+        });
     });
-  });
-};
+}
 
-const stopContainer = async (containerName) => {
-  return new Promise((resolve, reject) => {
-    exec(`docker stop ${containerName}`, (err) => {
-      if (err) return reject(err);
-      log('info', `Container stopped: ${containerName}`);
-      resolve();
+// Function to stop Docker container
+function stopContainer(containerName) {
+    return new Promise((resolve, reject) => {
+        exec(`docker stop ${containerName}`, (err, stdout) => {
+            if (err) {
+                console.error(`Error stopping container ${containerName}:`, err);
+                reject(err);
+            } else {
+                console.log(`Container ${containerName} stopped.`);
+                resolve(stdout.trim());
+            }
+        });
     });
-  });
-};
+}
 
-// Terminal management
-const createPty = (userId, containerName) => {
-  const term = pty.spawn('docker', [
-    'exec', '-i', containerName, 'bash', '-l'
-  ], {
-    name: 'xterm-256color',
-    cols: 80,
-    rows: 30,
-    cwd: '/app',
-    env: process.env
-  });
-
-  term.on('data', (data) => {
-    const socket = io.sockets.sockets.get(userId);
-    socket?.emit('terminal:data', data);
-  });
-
-  term.on('exit', () => {
-    log('info', `Terminal closed for user: ${userId}`);
-    userTerminals.delete(userId);
-    stopContainer(containerName).catch(err => 
-      log('error', `Container cleanup error: ${err.message}`)
-    );
-  });
-
-  userTerminals.set(userId, term);
-  return term;
-};
-
-// File system watcher
-const watcher = chokidar.watch(USER_DIR, {
-  ignored: /(^|[\/\\])\../,
-  persistent: true,
-  ignoreInitial: true
-});
-
-watcher.on('all', (event, filePath) => {
-  const segments = filePath.split(path.sep);
-  const userId = segments[segments.indexOf('users') + 1];
-  const relativePath = path.relative(path.join(USER_DIR, userId), filePath);
-  
-  if (userId && relativePath) {
-    io.to(userId).emit('file:refresh', { 
-      event, 
-      path: `/${relativePath.replace(/\\/g, '/')}` 
-    });
-  }
-});
-
-// WebSocket connections
-io.on('connection', async (socket) => {
-  const userId = socket.id;
-  log('info', `New connection: ${userId}`);
-
-  try {
-    const userDir = ensureUserDir(userId);
-    const containerName = await startContainer(userId, userDir);
-    createPty(userId, containerName);
-
-    socket.on('terminal:write', (data) => {
-      userTerminals.get(userId)?.write(data);
-    });
-
-    socket.on('terminal:resize', ({ cols, rows }) => {
-      userTerminals.get(userId)?.resize(cols, rows);
-    });
-
-    socket.on('file:change', async ({ path: filePath, content }) => {
-      const fullPath = path.join(userDir, filePath);
-      await fs.promises.writeFile(fullPath, content);
-      log('debug', `File updated: ${filePath}`);
-    });
-
-    socket.on('disconnect', async () => {
-      log('info', `Disconnected: ${userId}`);
-      const term = userTerminals.get(userId);
-      const container = userContainers.get(userId);
-      term?.kill();
-      if (container) await stopContainer(container);
-      userTerminals.delete(userId);
-      userContainers.delete(userId);
-    });
-
-  } catch (error) {
-    log('error', `Connection error: ${error.message}`);
-    socket.emit('error', { 
-      status: 'error',
-      code: 'INIT_FAILURE',
-      message: 'Failed to initialize environment'
-    });
-    socket.disconnect();
-  }
-});
-
-// API Endpoints
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
-});
-
-app.get('/files', async (req, res) => {
-  try {
-    const userId = req.query.userId;
-    if (!userId) {
-      return res.status(400).json({
-        status: 'error',
-        code: 'MISSING_USER_ID',
-        message: 'User ID is required'
-      });
+// Initialize PTY process
+function initializePty(userId) {
+    const cwd = path.join(__dirname, './user', userId);
+    if (!fs.existsSync(cwd)) {
+        fs.mkdirSync(cwd, { recursive: true });
     }
+    const term = pty.spawn(shell, [], {
+        name: 'xterm-color',
+        cols: 80,
+        rows: 30,
+        cwd: cwd,
+        env: process.env
+    });
+    userTerminals.set(userId, term);
 
-    const userDir = path.join(USER_DIR, userId);
-    ensureUserDir(userId);
-
-    const tree = await generateFileTree(userDir);
-    
-    res.json({
-      status: 'success',
-      data: {
-        path: '/',
-        name: 'root',
-        isDirectory: true,
-        children: tree
-      }
+    term.on('data', (data) => {
+        const socket = io.sockets.sockets.get(userId);
+        if (socket) {
+            socket.emit('terminal:data', { data });
+        }
     });
 
-  } catch (error) {
-    log('error', `Files endpoint error: ${error.message}`);
-    res.status(500).json({
-      status: 'error',
-      code: 'FILE_SYSTEM_ERROR',
-      message: 'Failed to read file structure',
-      ...(LOG_LEVEL === 'debug' && { debug: error.message })
+    term.on('exit', (code) => {
+        console.log(`Terminal exited with code ${code} for user ${userId}`);
+        const term = userTerminals.get(userId);
+        if (term) {
+            term.destroy();
+        }
+        userTerminals.delete(userId);
     });
-  }
+
+    term.on('error', (err) => {
+        console.error(`Terminal error for user ${userId}:`, err);
+        const term = userTerminals.get(userId);
+        if (term) {
+            term.destroy();
+        }
+        userTerminals.delete(userId);
+    });
+
+    return term;
+}
+
+// Watch for file changes
+const watcher = chokidar.watch('./user', {
+    ignored: /(^|[\/\\])\../,
+    persistent: true
+});
+watcher.on('all', (event, filePath) => {
+    console.log(event, filePath);
+    io.emit('file:refresh', filePath);
+});
+
+// Socket.IO connection handling
+io.on('connection', (socket) => {
+    console.log('New connection:', socket.id);
+    const userId = socket.id;
+    socket.userId = userId;
+
+    // Initialize terminal for user
+    const term = initializePty(userId);
+
+    // Handle terminal input
+    socket.on('terminal:write', (data) => {
+        const term = userTerminals.get(userId);
+        if (term) {
+            term.write(data);
+        }
+    });
+
+    // Handle terminal resize
+    socket.on('terminal:resize', ({ cols, rows }) => {
+        const term = userTerminals.get(userId);
+        if (term) {
+            term.resize(cols, rows);
+        }
+    });
+
+    // Handle file changes
+    socket.on('file:change', async ({ path: filePath, content }) => {
+        try {
+            const normalizedPath = filePath.replace(/^\.\/|^\//, '');
+            const fullPath = path.join('./user', userId, normalizedPath);
+            await fs.promises.writeFile(fullPath, content, 'utf8');
+        } catch (error) {
+            console.error('Error writing file:', error);
+            socket.emit('error', { message: 'Failed to write file' });
+        }
+    });
+
+    // Cleanup on disconnect
+    socket.on('disconnect', async () => {
+        console.log('Client disconnected:', userId);
+        const term = userTerminals.get(userId);
+        if (term) {
+            term.kill('SIGINT');
+            term.destroy();
+        }
+        userTerminals.delete(userId);
+        const containerName = userContainers.get(userId);
+        if (containerName) {
+            try {
+                await stopContainer(containerName);
+                userContainers.delete(userId);
+            } catch (error) {
+                console.error('Error stopping container:', error);
+            }
+        }
+    });
+});
+
+// API Routes
+app.get('/files', async (req, res) => {
+    try {
+        const userId = req.query.userId; // Ensure you pass userId in the query
+        if (!userId) {
+            return res.status(400).json({ error: 'User ID query parameter is required' });
+        }
+        const fileTree = await generateFileTree(path.join('./user', userId));
+        return res.json({ tree: fileTree });
+    } catch (error) {
+        console.error('Error generating file tree:', error);
+        return res.status(500).json({ error: 'Failed to generate file tree' });
+    }
 });
 
 app.get('/files/content', async (req, res) => {
-  try {
-    const { userId, path: filePath } = req.query;
-    if (!userId || !filePath) {
-      return res.status(400).json({
-        status: 'error',
-        code: 'MISSING_PARAMETERS',
-        message: 'Both userId and path are required'
-      });
-    }
-
-    const fullPath = path.join(USER_DIR, userId, filePath);
-    const content = await fs.promises.readFile(fullPath, 'utf8');
-    
-    res.json({
-      status: 'success',
-      data: { 
-        content,
-        metadata: {
-          path: filePath,
-          size: content.length,
-          modified: (await fs.promises.stat(fullPath)).mtime.toISOString()
+    try {
+        const filePath = req.query.path;
+        const userId = req.query.userId; // Ensure you pass userId in the query
+        if (!filePath || !userId) {
+            return res.status(400).json({ error: 'Path and User ID query parameters are required' });
         }
-      }
-    });
-
-  } catch (error) {
-    log('error', `File content error: ${error.message}`);
-    const statusCode = error.code === 'ENOENT' ? 404 : 500;
-    res.status(statusCode).json({
-      status: 'error',
-      code: error.code === 'ENOENT' ? 'FILE_NOT_FOUND' : 'READ_ERROR',
-      message: error.code === 'ENOENT' ? 'File not found' : 'Failed to read file'
-    });
-  }
+        const normalizedPath = filePath.replace(/^\.\/|^\//, '');
+        const fullPath = path.join('./user', userId, normalizedPath);
+        const content = await fs.promises.readFile(fullPath, 'utf8');
+        return res.json({ content });
+    } catch (error) {
+        console.error('Error reading file:', error);
+        return res.status(500).json({ error: 'Failed to read file' });
+    }
 });
 
-// File tree generator
-async function generateFileTree(dir) {
-  try {
-    const stats = await fs.promises.stat(dir);
-    if (!stats.isDirectory()) return [];
-
-    const children = await fs.promises.readdir(dir);
-    const filtered = children.filter(child => !child.startsWith('.'));
-
-    const tree = await Promise.all(filtered.map(async (child) => {
-      try {
-        const childPath = path.join(dir, child);
-        const stats = await fs.promises.stat(childPath);
-        
-        return {
-          path: path.relative(USER_DIR, childPath),
-          name: child,
-          isDirectory: stats.isDirectory(),
-          children: stats.isDirectory() ? await generateFileTree(childPath) : null
-        };
-      } catch (error) {
-        log('debug', `Skipping invalid entry: ${child}`);
-        return null;
-      }
-    }));
-
-    return tree.filter(Boolean);
-
-  } catch (error) {
-    log('error', `File tree error: ${error.message}`);
-    return [];
-  }
+// Generate file tree recursively
+async function generateFileTree(directory) {
+    const tree = {};
+    async function buildTree(currentDir, currentTree) {
+        const files = await fs.promises.readdir(currentDir);
+        for (const file of files) {
+            const filePath = path.join(currentDir, file);
+            const stat = await fs.promises.stat(filePath);
+            if (stat.isDirectory()) {
+                currentTree[file] = {};
+                await buildTree(filePath, currentTree[file]);
+            } else {
+                currentTree[file] = null;
+            }
+        }
+    }
+    await buildTree(directory, tree);
+    return tree;
 }
 
-server.listen(9000, () => {
-  log('info', 'Server started on port 9000');
-  if (!fs.existsSync(USER_DIR)) {
-    fs.mkdirSync(USER_DIR, { recursive: true });
-  }
-});
+// Start the server
+server.listen(9000, () => console.log('Server running on port 9000'));
