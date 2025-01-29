@@ -1,4 +1,7 @@
-node_modules/
-npm-debug.log
-.git/
-.vscode/
+node_modules
+.git
+.env
+*.md
+.editorconfig
+.gitignore
+.DS_Store
