@@ -1,7 +1,6 @@
+FROM node:18-bullseye
 
-FROM node:18
-
-# Install Docker CLI and dependencies
+# Install Docker CLI
 RUN apt-get update && \
     apt-get install -y \
     apt-transport-https \
@@ -14,11 +13,20 @@ RUN apt-get update && \
     apt-get update && \
     apt-get install -y docker-ce-cli
 
-# Set up project
+# Configure environment
 WORKDIR /app
 COPY package*.json ./
-RUN npm install
+RUN npm install --production && \
+    npm cache clean --force
+
+# Create user directory and set permissions
+RUN mkdir -p /app/users && \
+    chown -R node:node /app/users && \
+    chmod -R 755 /app/users
+
 COPY . .
 
+USER node
 EXPOSE 9000
+
 CMD ["node", "server.js"]
