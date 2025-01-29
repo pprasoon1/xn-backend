@@ -1,22 +1,21 @@
-
 services:
   - type: web
     name: xncode-backend
     plan: starter
     region: oregon
     dockerfilePath: Dockerfile
-    dockerBuildArgs:
-      - NODE_ENV=production
     envVars:
       - key: NODE_ENV
         value: production
+      - key: LOG_LEVEL
+        value: debug
     healthCheckPath: /health
-    privileged: true  # Required for Docker-in-Docker
+    privileged: true
     autoDeploy: true
     github:
       repo: https://github.com/pprasoon1/xn-backend
       branch: main
-      triggerType: commit
     ports:
       - port: 9000
         protocol: TCP
+
