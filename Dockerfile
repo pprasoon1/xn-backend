@@ -1,6 +1,6 @@
 FROM node:18-bullseye
 
-# Install Docker CLI
+# Install Docker CLI and dependencies
 RUN apt-get update && \
     apt-get install -y \
     apt-transport-https \
@@ -15,14 +15,16 @@ RUN apt-get update && \
 
 # Configure environment
 WORKDIR /app
+
+# Create user directory with proper permissions
+RUN mkdir -p /app/users && \
+    chown -R node:node /app/users && \
+    chmod -R 775 /app/users && \
+    chmod g+s /app/users
+
 COPY package*.json ./
 RUN npm install --production && \
     npm cache clean --force
-
-# Create user directory and set permissions
-RUN mkdir -p /app/users && \
-    chown -R node:node /app/users && \
-    chmod -R 755 /app/users
 
 COPY . .
 
