@@ -1,20 +1,18 @@
 services:
   - type: web
     name: xncode-backend
+    env: node
     plan: starter
     region: oregon
-    dockerfilePath: Dockerfile
+    buildCommand: "npm install && npm rebuild node-pty"
+    startCommand: "node server.js"
+    ports:
+      - port: 9000
     envVars:
       - key: NODE_ENV
         value: production
-      - key: LOG_LEVEL
-        value: debug
-    healthCheckPath: /health
-    privileged: true
+    healthCheckPath: /
     autoDeploy: true
-    github:
+    githubConnect:
       repo: https://github.com/pprasoon1/xn-backend
       branch: main
-    ports:
-      - port: 9000
-        protocol: TCP
