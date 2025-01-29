@@ -158,6 +158,7 @@ io.on('connection', async (socket) => {
     log('error', `Connection error: ${error.message}`);
     socket.emit('error', { 
       status: 'error',
+      code: 'INIT_FAILURE',
       message: 'Failed to initialize environment'
     });
     socket.disconnect();
@@ -179,7 +180,8 @@ app.get('/files', async (req, res) => {
     if (!userId) {
       return res.status(400).json({
         status: 'error',
-        message: 'Missing userId parameter'
+        code: 'MISSING_USER_ID',
+        message: 'User ID is required'
       });
     }
 
@@ -187,16 +189,23 @@ app.get('/files', async (req, res) => {
     ensureUserDir(userId);
 
     const tree = await generateFileTree(userDir);
+    
     res.json({
       status: 'success',
-      data: tree
+      data: {
+        path: '/',
+        name: 'root',
+        isDirectory: true,
+        children: tree
+      }
     });
 
   } catch (error) {
     log('error', `Files endpoint error: ${error.message}`);
     res.status(500).json({
       status: 'error',
-      message: 'Failed to read files',
+      code: 'FILE_SYSTEM_ERROR',
+      message: 'Failed to read file structure',
       ...(LOG_LEVEL === 'debug' && { debug: error.message })
     });
   }
@@ -208,7 +217,8 @@ app.get('/files/content', async (req, res) => {
     if (!userId || !filePath) {
       return res.status(400).json({
         status: 'error',
-        message: 'Missing required parameters'
+        code: 'MISSING_PARAMETERS',
+        message: 'Both userId and path are required'
       });
     }
 
@@ -217,13 +227,22 @@ app.get('/files/content', async (req, res) => {
     
     res.json({
       status: 'success',
-      data: { content }
+      data: { 
+        content,
+        metadata: {
+          path: filePath,
+          size: content.length,
+          modified: (await fs.promises.stat(fullPath)).mtime.toISOString()
+        }
+      }
     });
 
   } catch (error) {
     log('error', `File content error: ${error.message}`);
-    res.status(error.code === 'ENOENT' ? 404 : 500).json({
+    const statusCode = error.code === 'ENOENT' ? 404 : 500;
+    res.status(statusCode).json({
       status: 'error',
+      code: error.code === 'ENOENT' ? 'FILE_NOT_FOUND' : 'READ_ERROR',
       message: error.code === 'ENOENT' ? 'File not found' : 'Failed to read file'
     });
   }
@@ -238,12 +257,13 @@ async function generateFileTree(dir) {
     const children = await fs.promises.readdir(dir);
     const filtered = children.filter(child => !child.startsWith('.'));
 
-    return Promise.all(filtered.map(async (child) => {
+    const tree = await Promise.all(filtered.map(async (child) => {
       try {
         const childPath = path.join(dir, child);
         const stats = await fs.promises.stat(childPath);
         
         return {
+          path: path.relative(USER_DIR, childPath),
           name: child,
           isDirectory: stats.isDirectory(),
           children: stats.isDirectory() ? await generateFileTree(childPath) : null
@@ -252,7 +272,9 @@ async function generateFileTree(dir) {
         log('debug', `Skipping invalid entry: ${child}`);
         return null;
       }
-    })).then(results => results.filter(Boolean));
+    }));
+
+    return tree.filter(Boolean);
 
   } catch (error) {
     log('error', `File tree error: ${error.message}`);
