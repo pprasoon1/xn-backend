@@ -1,34 +1,24 @@
-FROM node:18-bullseye
+FROM node:latest
 
-# Install Docker CLI and dependencies
-RUN apt-get update && \
-    apt-get install -y \
-    apt-transport-https \
-    ca-certificates \
-    curl \
-    gnupg \
-    lsb-release && \
-    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null && \
-    apt-get update && \
-    apt-get install -y docker-ce-cli
+# Install build essentials
+RUN apt-get update && apt-get install -y \
+    python3 \
+    make \
+    g++ \
+    build-essential
 
-# Configure environment
-WORKDIR /app
+WORKDIR /user
 
-# Create user directory with proper permissions
-RUN mkdir -p /app/users && \
-    chown -R node:node /app/users && \
-    chmod -R 775 /app/users && \
-    chmod g+s /app/users
-
+# Copy package files
 COPY package*.json ./
-RUN npm install --production && \
-    npm cache clean --force
 
+# Install dependencies and rebuild node-pty
+RUN npm install
+RUN npm rebuild node-pty
+
+# Copy rest of the application
 COPY . .
 
-USER node
 EXPOSE 9000
 
 CMD ["node", "server.js"]
