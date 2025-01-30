@@ -14,5 +14,5 @@ services:
     healthCheckPath: /
     autoDeploy: true
     githubConnect:
-      repo: https://github.com/pprasoon1/xn-backend
+      repo: pprasoon1/xn-backend
       branch: main
