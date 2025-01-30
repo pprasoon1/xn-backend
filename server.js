@@ -26,6 +26,11 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
+// Health check endpoint
+app.get('/', (req, res) => {
+    res.status(200).send('Server is running');
+});
+
 // Store PTY instances and container names
 const userTerminals = new Map();
 const userContainers = new Map();
@@ -95,7 +100,7 @@ function initializePty(userId, containerName) {
     term.on('data', (data) => {
         const socket = io.sockets.sockets.get(userId);
         if (socket) {
-            socket.emit('terminal:data', { data });
+            socket.emit('terminal:data', data);
         }
     });
     term.on('exit', (code) => {
@@ -154,7 +159,7 @@ io.on('connection', async (socket) => {
         socket.on('file:change', async ({ path: filePath, content }) => {
             try {
                 const normalizedPath = filePath.replace(/^\.\/|^\//, '');
-                const fullPath = path.join('./users', userId, normalizedPath);
+                const fullPath = path.join(__dirname, 'users', userId, normalizedPath);
                 await fs.promises.writeFile(fullPath, content, 'utf8');
             } catch (error) {
                 console.error('Error writing file:', error);
@@ -164,12 +169,12 @@ io.on('connection', async (socket) => {
         socket.on('disconnect', async () => {
             console.log('Client disconnected:', userId);
             const term = userTerminals.get(userId);
+            const containerName = userContainers.get(userId);
             if (term) {
                 term.kill('SIGINT');
                 term.destroy();
             }
             userTerminals.delete(userId);
-            const containerName = userContainers.get(userId);
             if (containerName) {
                 try {
                     await stopContainer(containerName);
@@ -186,7 +191,7 @@ io.on('connection', async (socket) => {
     }
 });
 
-// API Routes
+// File API endpoints
 app.get('/files', async (req, res) => {
     try {
         const userId = req.query.userId; // Ensure you pass userId in the query
