@@ -1,12 +1,15 @@
-FROM node:latest
+# Use a specific Node.js LTS version
+FROM node:18
 
 # Install build essentials
 RUN apt-get update && apt-get install -y \
     python3 \
     make \
     g++ \
-    build-essential
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
+# Set the working directory
 WORKDIR /user
 
 # Copy package files
@@ -19,6 +22,8 @@ RUN npm rebuild node-pty
 # Copy rest of the application
 COPY . .
 
+# Expose the port the app runs on
 EXPOSE 9000
 
+# Start the application
 CMD ["node", "server.js"]
