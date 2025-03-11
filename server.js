@@ -3,265 +3,237 @@ const express = require('express');
 const fs = require('fs');
 const { Server } = require('socket.io');
 const pty = require('node-pty');
-const os = require('os');
 const path = require('path');
 const cors = require('cors');
 const chokidar = require('chokidar');
-const { exec } = require('child_process');
+const Docker = require('dockerode');
+const helmet = require('helmet');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
 
-// Shell configuration
-const shell = 'bash'; // Use bash directly
+// Configuration
+const config = {
+  PORT: process.env.PORT || 9000,
+  JWT_SECRET: process.env.JWT_SECRET || 'your_secure_secret',
+  NODE_ENV: process.env.NODE_ENV || 'development',
+  ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : ['http://localhost:3000'],
+  DOCKER_IMAGE: process.env.DOCKER_IMAGE || 'node:18-slim',
+  MAX_CONTAINERS: process.env.MAX_CONTAINERS || 10
+};
+
+// Initialize Docker client
+const docker = new Docker();
 
 // Express and Socket.IO setup
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: {
-        origin: '*', // Replace with your frontend domain
-        methods: ['GET', 'POST'],
-        credentials: true,
-        allowedHeaders: ['Content-Type', 'Authorization'],
-    }
-});
-app.use(cors({
-    origin: '*', // Replace with your frontend domain
+  cors: {
+    origin: '*',
     methods: ['GET', 'POST'],
-    credentials: true,
-    allowedHeaders: ['Content-Type', 'Authorization'],
-}));
-app.use(express.json());
-
-// Store PTY instances and container names for each user
-const userTerminals = new Map();
-const userContainers = new Map();
-
-// Function to ensure user directory exists and has initial files
-function ensureUserDirectoryExists(userId) {
-    const userDir = path.join(__dirname, './user', userId);
-    if (!fs.existsSync(userDir)) {
-        fs.mkdirSync(userDir, { recursive: true });
-        console.log(`Created user directory: ${userDir}`);
-        // Create an initial file
-        const initialFilePath = path.join(userDir, 'index.js');
-        if (!fs.existsSync(initialFilePath)) {
-            fs.writeFileSync(initialFilePath, 'console.log("Hello, World!");');
-            console.log(`Created initial file: ${initialFilePath}`);
-        }
-    }
-}
-
-// Function to start Docker container
-function startContainer(userId, projectPath) {
-    const containerName = `user_${userId}`;
-    const resolvedPath = path.resolve(projectPath);
-    const command = `docker run -d --rm --name ${containerName} -v "${resolvedPath}:/app" -w /app node:latest`;
-    return new Promise((resolve, reject) => {
-        exec(command, (err, stdout) => {
-            if (err) {
-                console.error(`Error starting container for user ${userId}:`, err);
-                reject(err);
-            } else {
-                console.log(`Container started for user ${userId}: ${stdout.trim()}`);
-                userContainers.set(userId, containerName);
-                resolve(containerName);
-            }
-        });
-    });
-}
-
-// Function to stop Docker container
-function stopContainer(containerName) {
-    return new Promise((resolve, reject) => {
-        exec(`docker stop ${containerName}`, (err, stdout) => {
-            if (err) {
-                console.error(`Error stopping container ${containerName}:`, err);
-                reject(err);
-            } else {
-                console.log(`Container ${containerName} stopped.`);
-                resolve(stdout.trim());
-            }
-        });
-    });
-}
-
-// Initialize PTY process
-function initializePty(userId) {
-    const cwd = path.join(__dirname, './user', userId);
-    ensureUserDirectoryExists(userId);
-    const term = pty.spawn(shell, [], {
-        name: 'xterm-color',
-        cols: 80,
-        rows: 30,
-        cwd: cwd,
-        env: process.env
-    });
-    userTerminals.set(userId, term);
-
-    term.on('data', (data) => {
-        const socket = io.sockets.sockets.get(userId);
-        if (socket) {
-            socket.emit('terminal:data', { data });
-        }
-    });
-
-    term.on('exit', (code) => {
-        console.log(`Terminal exited with code ${code} for user ${userId}`);
-        const term = userTerminals.get(userId);
-        if (term) {
-            term.destroy();
-        }
-        userTerminals.delete(userId);
-    });
-
-    term.on('error', (err) => {
-        console.error(`Terminal error for user ${userId}:`, err);
-        const term = userTerminals.get(userId);
-        if (term) {
-            term.destroy();
-        }
-        userTerminals.delete(userId);
-    });
-
-    return term;
-}
-
-// Watch for file changes
-const watcher = chokidar.watch('./user', {
-    ignored: /(^|[\/\\])\../,
-    persistent: true
+    credentials: true
+  }
 });
+
+// Security middleware
+app.use(helmet());
+app.use(cors({
+  origin: config.ALLOWED_ORIGINS,
+  methods: ['GET', 'POST'],
+  credentials: true
+}));
+
+// Rate limiting
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use(apiLimiter);
+
+// Authentication middleware
+const authenticate = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Authentication required' });
+
+  try {
+    const decoded = jwt.verify(token, config.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+// Store PTY instances and container instances
+const userSessions = new Map();
+
+// Secure path validation
+const validatePath = (userId, filePath) => {
+  const userDir = path.join(__dirname, 'user', userId);
+  const resolvedPath = path.resolve(path.join(userDir, filePath));
+  return resolvedPath.startsWith(userDir);
+};
+
+// Docker container management
+async function createContainer(userId) {
+  const userDir = path.join(__dirname, 'user', userId);
+  
+  try {
+    return await docker.createContainer({
+      Image: config.DOCKER_IMAGE,
+      HostConfig: {
+        Binds: [`${userDir}:/app:rw`],
+        Memory: 512 * 1024 * 1024, // 512MB
+        CpuShares: 512,
+        SecurityOpt: ['no-new-privileges']
+      },
+      WorkingDir: '/app',
+      Cmd: ['tail', '-f', '/dev/null']
+    });
+  } catch (err) {
+    console.error(`Container creation failed for ${userId}:`, err);
+    throw new Error('Container creation failed');
+  }
+}
+
+// Initialize PTY process with container
+async function initializeEnvironment(userId) {
+  const userDir = path.join(__dirname, 'user', userId);
+  
+  try {
+    // Create user directory
+    await fs.promises.mkdir(userDir, { recursive: true });
+    
+    // Create Docker container
+    const container = await createContainer(userId);
+    await container.start();
+    
+    // Initialize PTY
+    const term = pty.spawn('docker', ['exec', '-i', container.id, 'bash'], {
+      name: 'xterm-256color',
+      cols: 80,
+      rows: 30,
+      cwd: userDir,
+      env: process.env
+    });
+
+    // Store session
+    userSessions.set(userId, { container, term });
+    
+    return term;
+  } catch (err) {
+    console.error(`Environment initialization failed for ${userId}:`, err);
+    throw err;
+  }
+}
+
+// File system watcher
+const watcher = chokidar.watch('./user', {
+  ignored: /(^|[\/\\])\../,
+  persistent: true,
+  ignoreInitial: true
+});
+
 watcher.on('all', (event, filePath) => {
-    console.log(event, filePath);
-    io.emit('file:refresh', filePath);
+  io.emit('file:refresh', { event, path: filePath });
 });
 
 // Socket.IO connection handling
-io.on('connection', (socket) => {
-    console.log('New connection:', socket.id);
-    const userId = socket.id;
-    socket.userId = userId;
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+  if (!token) return next(new Error('Authentication required'));
 
-    // Ensure user directory exists
-    ensureUserDirectoryExists(userId);
+  jwt.verify(token, config.JWT_SECRET, (err, decoded) => {
+    if (err) return next(new Error('Invalid token'));
+    socket.user = decoded;
+    next();
+  });
+});
 
-    // Initialize terminal for user
-    const term = initializePty(userId);
+io.on('connection', async (socket) => {
+  const userId = socket.user.userId;
+  console.log(`New connection: ${userId}`);
 
-    // Handle terminal input
+  try {
+    const term = await initializeEnvironment(userId);
+    
+    term.on('data', (data) => {
+      socket.emit('terminal:data', data);
+    });
+
     socket.on('terminal:write', (data) => {
-        const term = userTerminals.get(userId);
-        if (term) {
-            term.write(data);
-        }
+      term.write(data);
     });
 
-    // Handle terminal resize
     socket.on('terminal:resize', ({ cols, rows }) => {
-        const term = userTerminals.get(userId);
-        if (term) {
-            term.resize(cols, rows);
-        }
+      term.resize(cols, rows);
     });
 
-    // Handle file changes
-    socket.on('file:change', async ({ path: filePath, content }) => {
-        try {
-            const normalizedPath = filePath.replace(/^\.\/|^\//, '');
-            const fullPath = path.join('./user', userId, normalizedPath);
-            await fs.promises.writeFile(fullPath, content, 'utf8');
-        } catch (error) {
-            console.error('Error writing file:', error);
-            socket.emit('error', { message: 'Failed to write file' });
+    socket.on('file:save', async ({ path: filePath, content }, callback) => {
+      try {
+        if (!validatePath(userId, filePath)) {
+          throw new Error('Invalid file path');
         }
+
+        const fullPath = path.join(__dirname, 'user', userId, filePath);
+        await fs.promises.writeFile(fullPath, content);
+        callback({ status: 'success' });
+      } catch (err) {
+        console.error('File save error:', err);
+        callback({ status: 'error', message: err.message });
+      }
     });
 
-    // Cleanup on disconnect
     socket.on('disconnect', async () => {
-        console.log('Client disconnected:', userId);
-        const term = userTerminals.get(userId);
-        if (term) {
-            term.kill('SIGINT');
-            term.destroy();
+      console.log(`Disconnected: ${userId}`);
+      const session = userSessions.get(userId);
+      if (session) {
+        session.term.kill();
+        try {
+          await session.container.stop();
+          await session.container.remove();
+        } catch (err) {
+          console.error('Container cleanup error:', err);
         }
-        userTerminals.delete(userId);
-        const containerName = userContainers.get(userId);
-        if (containerName) {
-            try {
-                await stopContainer(containerName);
-                userContainers.delete(userId);
-            } catch (error) {
-                console.error('Error stopping container:', error);
-            }
-        }
+        userSessions.delete(userId);
+      }
     });
+
+  } catch (err) {
+    console.error('Connection setup failed:', err);
+    socket.emit('error', { message: 'Initialization failed' });
+    socket.disconnect(true);
+  }
 });
 
 // API Routes
-app.get('/files', async (req, res) => {
-    try {
-        const userId = req.query.userId;
-        if (!userId) {
-            return res.status(400).json({ error: 'User ID query parameter is required' });
-        }
-        ensureUserDirectoryExists(userId);
-        const userDir = path.join(__dirname, './user', userId);
-        const fileTree = await generateFileTree(userDir);
-        if (Object.keys(fileTree).length === 0) {
-            console.warn(`Empty file tree for user ${userId}: ${userDir}`);
-        }
-        return res.json({ tree: fileTree });
-    } catch (error) {
-        console.error('Error generating file tree:', error);
-        return res.status(500).json({ error: 'Failed to generate file tree' });
-    }
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK',
+    containers: userSessions.size,
+    maxContainers: config.MAX_CONTAINERS
+  });
 });
 
-app.get('/files/content', async (req, res) => {
-    try {
-        const filePath = req.query.path;
-        const userId = req.query.userId;
-        if (!filePath || !userId) {
-            return res.status(400).json({ error: 'Path and User ID query parameters are required' });
-        }
-        ensureUserDirectoryExists(userId);
-        const userDir = path.join(__dirname, './user', userId);
-        const normalizedPath = filePath.replace(/^\.\/|^\//, '');
-        const fullPath = path.join(userDir, normalizedPath);
-        if (!fs.existsSync(fullPath)) {
-            return res.status(404).json({ error: 'File not found' });
-        }
-        const content = await fs.promises.readFile(fullPath, 'utf8');
-        return res.json({ content });
-    } catch (error) {
-        console.error('Error reading file:', error);
-        return res.status(500).json({ error: 'Failed to read file' });
-    }
+app.get('/files', authenticate, async (req, res) => {
+  try {
+    const userDir = path.join(__dirname, 'user', req.user.userId);
+    const files = await fs.promises.readdir(userDir);
+    res.json({ files });
+  } catch (err) {
+    res.status(500).json({ error: 'File system error' });
+  }
 });
 
-// Generate file tree recursively
-async function generateFileTree(directory) {
-    const tree = {};
-    try {
-        if (!fs.existsSync(directory)) {
-            console.log(`Directory does not exist: ${directory}`);
-            return tree;
-        }
-        const files = await fs.promises.readdir(directory);
-        for (const file of files) {
-            const filePath = path.join(directory, file);
-            const stat = await fs.promises.stat(filePath);
-            if (stat.isDirectory()) {
-                tree[file] = await generateFileTree(filePath);
-            } else {
-                tree[file] = null;
-            }
-        }
-    } catch (error) {
-        console.error('Error generating file tree:', error);
-        throw error;
-    }
-    return tree;
-}
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Server error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
 
-// Start the server
-server.listen(9000, () => console.log('Server running on port 9000'));
+// Start server
+server.listen(config.PORT, () => {
+  console.log(`Server running in ${config.NODE_ENV} mode on port ${config.PORT}`);
+});
